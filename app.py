@@ -36,7 +36,13 @@ shrink_tolerance_pct = st.sidebar.slider(
 near_high_pct = st.sidebar.slider("Must be within X% of base high", 5, 40, 15)
 vol_lookback = st.sidebar.slider("Volume trend lookback (bars)", 10, 60, 20)
 
-MAX_SCORE = 5
+st.sidebar.header("RMV (Relative Measured Volatility)")
+rmv_atr_length = st.sidebar.slider("RMV smoothing (1 = raw, DeepVue-style)", 1, 14, 1)
+rmv_lookback = st.sidebar.slider("RMV lookback period", 5, 30, 15)
+rmv_tight_level = st.sidebar.slider("RMV tight threshold", 5, 40, 20)
+rmv_extended_level = st.sidebar.slider("RMV extended threshold", 60, 95, 80)
+
+MAX_SCORE = 6
 
 
 def parse_watchlist(raw):
@@ -51,6 +57,37 @@ def get_data(sym, per):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna(subset=["High", "Low", "Close", "Volume"])
     return df
+
+
+def compute_rmv(df, atr_length=1, lookback=15):
+    """
+    Direct port of the ThinkScript RMV: raw (or lightly smoothed) True Range,
+    normalized as a percentile rank against its own rolling highest/lowest
+    over `lookback` bars. Self-calibrating 0-100 scale, same as the chart
+    version -- 0 = tightest range in the window, 100 = widest.
+    """
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    if atr_length <= 1:
+        atr_val = true_range
+    else:
+        atr_val = true_range.rolling(atr_length).mean()
+
+    highest_atr = atr_val.rolling(lookback).max()
+    lowest_atr = atr_val.rolling(lookback).min()
+    atr_range = highest_atr - lowest_atr
+
+    rmv = np.where(atr_range > 0, (atr_val - lowest_atr) / atr_range * 100, 0)
+    return pd.Series(rmv, index=df.index)
 
 
 def dedupe_adjacent(idx_array, min_gap):
@@ -108,7 +145,8 @@ def compute_legs(clean_pivots):
 
 
 def score_vcp(df, pivot_window, num_contractions, max_pullback_pct,
-               shrink_tolerance_pct, near_high_pct, vol_lookback):
+               shrink_tolerance_pct, near_high_pct, vol_lookback,
+               rmv_atr_length, rmv_lookback, rmv_tight_level, rmv_extended_level):
     clean_pivots = detect_pivots(df, pivot_window)
     legs = compute_legs(clean_pivots)
     recent_legs = legs[-num_contractions:] if len(legs) >= num_contractions else legs
@@ -167,6 +205,15 @@ def score_vcp(df, pivot_window, num_contractions, max_pullback_pct,
     else:
         notes.append(f"❌ More than {near_high_pct}% off the base high")
 
+    rmv_series = compute_rmv(df, rmv_atr_length, rmv_lookback)
+    current_rmv = rmv_series.iloc[-1]
+    rmv_is_tight = current_rmv <= rmv_tight_level
+    if rmv_is_tight:
+        score += 1
+        notes.append(f"✅ RMV is tight ({current_rmv:.1f}, below {rmv_tight_level}) — coiled volatility")
+    else:
+        notes.append(f"❌ RMV is not currently tight ({current_rmv:.1f})")
+
     return {
         "score": score,
         "notes": notes,
@@ -177,14 +224,18 @@ def score_vcp(df, pivot_window, num_contractions, max_pullback_pct,
         "pct_off_high": pct_off_high,
         "baseline_vol": baseline_vol,
         "vol_declining": vol_declining,
+        "rmv_series": rmv_series,
+        "current_rmv": current_rmv,
+        "rmv_is_tight": rmv_is_tight,
     }
 
 
-def render_detail_chart(ticker, df, result):
+def render_detail_chart(ticker, df, result, rmv_tight_level, rmv_extended_level):
     clean_pivots = result["clean_pivots"]
     recent_legs = result["recent_legs"]
     base_high = result["base_high"]
     baseline_vol = result["baseline_vol"]
+    rmv_series = result["rmv_series"]
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
@@ -238,6 +289,36 @@ def render_detail_chart(ticker, df, result):
                           xaxis_rangeslider_visible=False)
     st.plotly_chart(vol_fig, use_container_width=True)
 
+    # RMV subplot -- mirrors the ThinkScript pane: line + tight/extended
+    # reference bands + shaded tight zone
+    rmv_fig = go.Figure()
+    rmv_fig.add_trace(go.Scatter(
+        x=df.index, y=rmv_series, name="RMV", line=dict(color="cyan", width=2)
+    ))
+    rmv_fig.add_hline(y=rmv_tight_level, line_dash="dash", line_color="green",
+                      annotation_text=f"Tight ({rmv_tight_level})")
+    rmv_fig.add_hline(y=rmv_extended_level, line_dash="dash", line_color="red",
+                      annotation_text=f"Extended ({rmv_extended_level})")
+    rmv_fig.add_hline(y=50, line_dash="dot", line_color="gray")
+
+    # Shade the tight zone (0 to tight threshold) whenever RMV is inside it
+    tight_zone = rmv_series.where(rmv_series <= rmv_tight_level, np.nan)
+    rmv_fig.add_trace(go.Scatter(
+        x=df.index, y=tight_zone, fill="tozeroy",
+        fillcolor="rgba(0,100,0,0.4)", line=dict(width=0),
+        showlegend=False, hoverinfo="skip"
+    ))
+
+    current_rmv = result["current_rmv"]
+    rmv_fig.update_layout(
+        height=220,
+        title=f"RMV: {current_rmv:.1f}" + (" (TIGHT)" if result["rmv_is_tight"] else ""),
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_rangeslider_visible=False,
+        yaxis=dict(range=[0, 100])
+    )
+    st.plotly_chart(rmv_fig, use_container_width=True)
+
 
 # ============================================================
 # MAIN: RUN SCAN
@@ -256,7 +337,8 @@ if st.sidebar.button("🔍 Run Scan", type="primary"):
                 errors.append(f"{t}: insufficient data")
                 continue
             result = score_vcp(df, pivot_window, num_contractions, max_pullback_pct,
-                                shrink_tolerance_pct, near_high_pct, vol_lookback)
+                                shrink_tolerance_pct, near_high_pct, vol_lookback,
+                                rmv_atr_length, rmv_lookback, rmv_tight_level, rmv_extended_level)
             results[t] = {"df": df, "result": result}
         except Exception as e:
             errors.append(f"{t}: {e}")
@@ -291,6 +373,8 @@ if "scan_results" in st.session_state and st.session_state["scan_results"]:
             "Ticker": t,
             "Score": r["score"],
             "% Off High": round(r["pct_off_high"], 1),
+            "RMV": round(r["current_rmv"], 1),
+            "RMV Tight": "Yes" if r["rmv_is_tight"] else "No",
             "Vol Contracting": "Yes" if r["vol_declining"] else "No",
             "Contractions Found": len(r["recent_legs"]),
         })
@@ -314,6 +398,8 @@ if "scan_results" in st.session_state and st.session_state["scan_results"]:
             with col2:
                 st.subheader(f"{selected_ticker} Score")
                 st.metric("Score", f"{result['score']} / {MAX_SCORE}")
+                st.metric("Current RMV", f"{result['current_rmv']:.1f}",
+                           delta="TIGHT" if result["rmv_is_tight"] else None)
                 st.markdown("**Checklist:**")
                 for n in result["notes"]:
                     st.write(n)
@@ -330,7 +416,7 @@ if "scan_results" in st.session_state and st.session_state["scan_results"]:
                     st.dataframe(leg_table, use_container_width=True, hide_index=True)
 
             with col1:
-                render_detail_chart(selected_ticker, df, result)
+                render_detail_chart(selected_ticker, df, result, rmv_tight_level, rmv_extended_level)
     else:
         st.info("No names meet that score threshold. Try lowering the minimum score.")
 else:
