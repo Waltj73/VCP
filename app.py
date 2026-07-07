@@ -15,7 +15,7 @@ st.caption("Scans a watchlist, scores each name on VCP criteria, and lets you dr
 st.sidebar.header("Watchlist")
 watchlist_input = st.sidebar.text_area(
     "Tickers (comma or newline separated)",
-    value="NVDA, INTC, SPCX, PFE, TSLA, AAPL, PLTR, MU, SPY, NFLX, AMD, SMCI, AMZN, MSFT, QQQ, NKE, MRVL, WMT, AVGO, IWM, GOOGL, GOOG, SLV, META, TSM, KLAC, XOM, CRM, LRCX, SLB, CVX, FCX, CSX, MRK, AA, ARM, BA, UNH, VOO, HON, HAL, MCD, MCHP, OXY, JPM, GLD, SBUX, DIA, GE, LULU, RTX, LLY, LOW, COST, UNP",
+    value="NVDA, INTC, PFE, TSLA, AAPL, PLTR, MU, SPY, NFLX, AMD, SMCI, AMZN, MSFT, QQQ, NKE, MRVL, WMT, AVGO, IWM, GOOGL, GOOG, SLV, META, TSM, KLAC, XOM, CRM, LRCX, SLB, CVX, FCX, CSX, MRK, AA, ARM, BA, UNH, VOO, HON, HAL, MCD, MCHP, OXY, JPM, GLD, SBUX, DIA, GE, LULU, RTX, LLY, LOW, COST, UNP",
     height=150
 )
 period = st.sidebar.selectbox("History window", ["6mo", "1y", "2y", "3y"], index=1)
