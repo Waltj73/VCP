@@ -42,7 +42,7 @@ rmv_lookback = st.sidebar.slider("RMV lookback period", 5, 30, 15)
 rmv_tight_level = st.sidebar.slider("RMV tight threshold", 5, 40, 20)
 rmv_extended_level = st.sidebar.slider("RMV extended threshold", 60, 95, 80)
 
-MAX_SCORE = 6
+MAX_SCORE = 8
 
 
 def parse_watchlist(raw):
@@ -214,6 +214,54 @@ def score_vcp(df, pivot_window, num_contractions, max_pullback_pct,
     else:
         notes.append(f"❌ RMV is not currently tight ({current_rmv:.1f})")
 
+    # ---- STAGE 2 TREND CONTEXT ----
+    # Minervini's own checklist treats this as non-negotiable: price above
+    # rising 50/150/200-day MAs, properly stacked (50 > 150 > 200). A
+    # shrinking-pullback sequence during a downtrend/rollover is NOT a VCP,
+    # it's just a compressing range on the way down.
+    ma50 = df["Close"].rolling(50).mean()
+    ma150 = df["Close"].rolling(150).mean()
+    ma200 = df["Close"].rolling(200).mean()
+
+    has_ma_data = len(df) >= 200
+    if has_ma_data:
+        price_above_all = (current_close > ma50.iloc[-1] and
+                            current_close > ma150.iloc[-1] and
+                            current_close > ma200.iloc[-1])
+        properly_stacked = ma50.iloc[-1] > ma150.iloc[-1] > ma200.iloc[-1]
+        ma50_rising = ma50.iloc[-1] > ma50.iloc[-6]  # rising over the last ~week
+        stage2_confirmed = price_above_all and properly_stacked and ma50_rising
+    else:
+        stage2_confirmed = False
+
+    if stage2_confirmed:
+        score += 1
+        notes.append("✅ Stage 2 uptrend confirmed (price above rising, stacked 50/150/200-day MAs)")
+    elif not has_ma_data:
+        notes.append("❌ Not enough history to confirm Stage 2 trend (need 200+ bars)")
+    else:
+        notes.append("❌ Stage 2 trend NOT confirmed — MAs not stacked/rising, or price below one")
+
+    # ---- HIGHER LOWS (CONSTRUCTIVE CONSOLIDATION) ----
+    # Shrinking pullback PERCENTAGES alone can happen during a rollover, if
+    # the overall range is compressing while price still grinds lower. A
+    # genuine VCP requires each contraction's actual LOW to sit above the
+    # prior contraction's low -- an ascending floor, not just a shrinking one.
+    higher_lows = True
+    if len(recent_legs) >= 2:
+        for i in range(1, len(recent_legs)):
+            if recent_legs[i]["low_price"] <= recent_legs[i - 1]["low_price"]:
+                higher_lows = False
+                break
+    else:
+        higher_lows = False
+
+    if higher_lows and has_enough_legs:
+        score += 1
+        notes.append("✅ Higher lows across contractions (constructive, ascending base)")
+    else:
+        notes.append("❌ Lows are NOT rising across contractions — may be distribution, not accumulation")
+
     return {
         "score": score,
         "notes": notes,
@@ -227,6 +275,11 @@ def score_vcp(df, pivot_window, num_contractions, max_pullback_pct,
         "rmv_series": rmv_series,
         "current_rmv": current_rmv,
         "rmv_is_tight": rmv_is_tight,
+        "stage2_confirmed": stage2_confirmed,
+        "higher_lows": higher_lows,
+        "ma50": ma50,
+        "ma150": ma150,
+        "ma200": ma200,
     }
 
 
@@ -236,12 +289,22 @@ def render_detail_chart(ticker, df, result, rmv_tight_level, rmv_extended_level)
     base_high = result["base_high"]
     baseline_vol = result["baseline_vol"]
     rmv_series = result["rmv_series"]
+    ma50 = result["ma50"]
+    ma150 = result["ma150"]
+    ma200 = result["ma200"]
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"],
         low=df["Low"], close=df["Close"], name="Price"
     ))
+
+    fig.add_trace(go.Scatter(x=df.index, y=ma50, name="50 MA",
+                              line=dict(color="yellow", width=1)))
+    fig.add_trace(go.Scatter(x=df.index, y=ma150, name="150 MA",
+                              line=dict(color="orange", width=1)))
+    fig.add_trace(go.Scatter(x=df.index, y=ma200, name="200 MA",
+                              line=dict(color="magenta", width=1)))
 
     h_dates = [p[0] for p in clean_pivots if p[2] == "H"]
     h_vals = [p[1] for p in clean_pivots if p[2] == "H"]
@@ -375,6 +438,8 @@ if "scan_results" in st.session_state and st.session_state["scan_results"]:
             "% Off High": round(r["pct_off_high"], 1),
             "RMV": round(r["current_rmv"], 1),
             "RMV Tight": "Yes" if r["rmv_is_tight"] else "No",
+            "Stage 2": "Yes" if r["stage2_confirmed"] else "No",
+            "Higher Lows": "Yes" if r["higher_lows"] else "No",
             "Vol Contracting": "Yes" if r["vol_declining"] else "No",
             "Contractions Found": len(r["recent_legs"]),
         })
@@ -400,6 +465,9 @@ if "scan_results" in st.session_state and st.session_state["scan_results"]:
                 st.metric("Score", f"{result['score']} / {MAX_SCORE}")
                 st.metric("Current RMV", f"{result['current_rmv']:.1f}",
                            delta="TIGHT" if result["rmv_is_tight"] else None)
+                col_a, col_b = st.columns(2)
+                col_a.metric("Stage 2", "✅ Yes" if result["stage2_confirmed"] else "❌ No")
+                col_b.metric("Higher Lows", "✅ Yes" if result["higher_lows"] else "❌ No")
                 st.markdown("**Checklist:**")
                 for n in result["notes"]:
                     st.write(n)
